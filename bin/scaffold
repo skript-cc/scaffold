@@ -216,6 +216,7 @@ setup_wordpress_theme() {
 
     $composer init -n \
         --name "skript.cc/theme-${PROJECT_SLUG}" \
+        --require "composer/installers: ^1.6.0" \
         "${OPTS[@]}"
 }
 
