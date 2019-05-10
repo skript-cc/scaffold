@@ -1,0 +1,274 @@
+#!/bin/bash
+
+set -e
+
+PROJECT_ROOT=`realpath $(dirname "${BASH_SOURCE[0]}")/..`
+composer="php $PROJECT_ROOT/composer.phar"
+
+usage() {
+    cat <<EOF
+Usage: $0 [-p <Project name>]
+Bootstraps a new wordpress project.
+
+Options:
+  -p  The name of the project
+  -d  Use default settings instead of asking for them. -p is required with this option.
+  -h  Shows this help message
+EOF
+    exit 1
+}
+
+run() {
+    if [ -z "$PROJECT_ROOT" ] ; then
+        echo "ERROR: Please set the \$PROJECT_ROOT variable before invoking this function"
+        exit 1
+    fi
+
+    # Change CWD
+    pushd $PROJECT_ROOT > /dev/null
+
+    # Load environment vars
+    if [ -f .env ] ; then 
+        set -o allexport
+        source .env
+        set +o allexport
+    fi
+
+    # Execute whatever is passed to this function
+    $@
+
+    # Change CWD back
+    popd > /dev/null
+}
+
+collect_project_info() {
+    
+    while [ -z "$PROJECT_NAME" ] ; do
+        echo "> How would you like to name this project?"
+        read PROJECT_NAME
+    done
+    
+    if [ `which iconv` ] && [ `which sed` ] ; then
+        PROJECT_SLUG=$(echo "$PROJECT_NAME" | iconv -t ascii//TRANSLIT | sed -E 's/[~\^]+//g' | sed -E 's/[^a-zA-Z0-9]+/-/g' | sed -E 's/^-+\|-+$//g' | sed -E 's/^-+//g' | sed -E 's/-+$//g' | tr A-Z a-z)
+    else
+        echo "Failed to create project slug"
+        exit 1
+    fi
+    
+    # Set project defaults
+    local DEFAULTS=()
+    DEFAULTS+=(PROJECT_DESCRIPTION "Wordpress website for $PROJECT_NAME")
+    DEFAULTS+=(PROJECT_LICENSE "UNLICENSED")
+    DEFAULTS+=(INSTALL_CUSTOM_THEME 1)
+    DEFAULTS+=(WP_INSTALL_DIR "public")
+    if [ `which git` ] ; then
+        DEFAULTS+=(PROJECT_AUTHOR_NAME "$(git config user.name)")
+        DEFAULTS+=(PROJECT_AUTHOR_EMAIL "$(git config user.email)")
+    fi
+    
+    local defaults_total=$(expr ${#DEFAULTS[*]} - 1)
+    
+    if [ ! $USE_DEFAULTS ] ; then
+        local DEFAULT_PREFIX='DEFAULT_'
+    fi
+    
+    for (( i=0; i<$defaults_total; i+=2 )) ; do
+        printf -v "${DEFAULT_PREFIX}${DEFAULTS[$i]}" '%s' "${DEFAULTS[$i+1]}"
+    done
+    
+    if [ $USE_DEFAULTS ] ; then
+        return
+    fi
+    
+    # Ask for values
+    echo "> Can you give a small description? [$DEFAULT_PROJECT_DESCRIPTION]"
+    read PROJECT_DESCRIPTION
+    
+    if [ -z "$PROJECT_DESCRIPTION" ] ; then
+        PROJECT_DESCRIPTION="$DEFAULT_PROJECT_DESCRIPTION"
+    fi
+    
+    echo "> Are you the author? [$DEFAULT_PROJECT_AUTHOR_NAME <$DEFAULT_PROJECT_AUTHOR_EMAIL>]"
+    read IS_AUTHOR
+    
+    if [ "$IS_AUTHOR" == 'no' ] ; then
+        echo "> What's the author's name?"
+        read PROJECT_AUTHOR_NAME
+        
+        echo "> What's the author's e-mail address?"
+        read PROJECT_AUTHOR_EMAIL
+    else
+        PROJECT_AUTHOR_NAME="$DEFAULT_PROJECT_AUTHOR_NAME"
+        PROJECT_AUTHOR_EMAIL="$DEFAULT_PROJECT_AUTHOR_EMAIL"
+    fi
+    
+    echo "> Which license do you want to use? [$DEFAULT_PROJECT_LICENSE]"
+    read PROJECT_LICENSE
+    
+    if [ -z "$PROJECT_LICENSE" ] ; then
+        PROJECT_LICENSE="$DEFAULT_PROJECT_LICENSE"
+    fi
+    
+    echo "> Do you want to install a custom wordpress theme? [yes]"
+    read INSTALL_CUSTOM_THEME
+    
+    if [ -z "$INSTALL_CUSTOM_THEME" ] || [ "$INSTALL_CUSTOM_THEME" == 'yes' ] ; then
+        INSTALL_CUSTOM_THEME=1
+    else
+        INSTALL_CUSTOM_THEME=$DEFAULT_INSTALL_CUSTOM_THEME
+    fi
+    
+    WP_INSTALL_DIR="$DEFAULT_WP_INSTALL_DIR"
+}
+
+get_latest_wordpress_version() {
+    if [ `which curl` ] && [ `which jq` ] ; then
+        curl -s 'https://api.github.com/repos/WordPress/WordPress/tags' | jq -r '.[0].name'
+    else
+        echo '*'
+    fi
+}
+
+inject_json() {
+    local jsonstr=$1
+    local selector=$2
+    local jsonfile=$3
+    if [ -z "$jsonfile" ] || [ -z "$jsonstr" ] ; then
+        return
+    fi
+    local tmp=$(mktemp)
+    jq --argjson obj "$jsonstr" "${selector}=\$obj" "$jsonfile" > "$tmp" \
+        && mv "$tmp" "$jsonfile"
+}
+
+setup_wordpress() {
+    mkdir -p wp/
+    cd wp/
+
+    local OPTS=()
+    
+    if [ -n "$PROJECT_DESCRIPTION" ] ; then
+        OPTS+=(--description "$PROJECT_DESCRIPTION")
+    fi
+    
+    if [ -n "$PROJECT_AUTHOR_NAME" ] && [ -n "$PROJECT_AUTHOR_EMAIL" ] ; then
+        OPTS+=(--author "$PROJECT_AUTHOR_NAME <$PROJECT_AUTHOR_EMAIL>")
+    fi
+    
+    if [ -n "$PROJECT_LICENSE" ] ; then
+        OPTS+=(--license "$PROJECT_LICENSE")
+    fi
+    
+    if [ $INSTALL_CUSTOM_THEME ] ; then
+        OPTS+=(--repository '{"type": "path", "url": "../wp-theme"}')
+    fi
+    
+    $composer init -n \
+        --name "skript.cc/wp-${PROJECT_SLUG}" \
+        --type "project" \
+        --repository "https://wpackagist.org" \
+        --repository "https://wp-languages.github.io" \
+        --require "johnpbloch/wordpress:^$(get_latest_wordpress_version)" \
+        "${OPTS[@]}"
+    
+    local extra_json=$(cat <<EOF
+    {
+        "wordpress-install-dir": "${WP_INSTALL_DIR}",
+        "installer-paths": {
+            "public/content/mu-plugins/{\$name}": ["type:wordpress-muplugin"],
+            "public/content/plugins/{\$name}": ["type:wordpress-plugin"],
+            "public/content/themes/{\$name}": ["type:wordpress-theme"]
+        }
+    } 
+EOF
+)
+    local scripts_json=$(cat <<EOF
+    {
+        "build": "@composer install --no-dev --prefer-dist --no-interaction -o"
+    }
+EOF
+)
+    
+    inject_json "$scripts_json" '.scripts' composer.json
+    inject_json "$extra_json" '.extra' composer.json
+    
+    #local tmp=$(mktemp)
+    #jq --argjson obj "$extra_json" '.extra=$obj' composer.json > "$tmp" && mv "$tmp" composer.json
+}
+
+setup_wordpress_theme() {
+    mkdir -p wp-theme/
+    cd wp-theme/
+
+    local OPTS=()
+
+    if [ -n "$PROJECT_DESCRIPTION" ] ; then
+        OPTS+=(--description "$PROJECT_DESCRIPTION")
+    fi
+    
+    if [ -n "$PROJECT_AUTHOR_NAME" ] && [ -n "$PROJECT_AUTHOR_EMAIL" ] ; then
+        OPTS+=(--author "$PROJECT_AUTHOR_NAME <$PROJECT_AUTHOR_EMAIL>")
+    fi
+    
+    if [ -n "$PROJECT_LICENSE" ] ; then
+        OPTS+=(--license "$PROJECT_LICENSE")
+    fi
+
+    $composer init -n \
+        --name "skript.cc/theme-${PROJECT_SLUG}" \
+        "${OPTS[@]}"
+}
+
+create_readme() {
+    cat > README.md <<EOF
+# ${PROJECT_NAME}
+${PROJECT_DESCRIPTION}
+EOF
+}
+
+create_changelog() {
+    cat > CHANGELOG.md <<EOF
+# Changelog
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+# Unreleased
+
+EOF
+}
+
+# Process options
+
+while getopts ":p:dh" o; do
+    case "${o}" in
+        p)
+            PROJECT_NAME=${OPTARG}
+            ;;
+        d)
+            USE_DEFAULTS=1
+            ;;
+        h)
+            SHOW_HELP=1
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
+shift $((OPTIND-1))
+
+if [ $SHOW_HELP ]; then
+    usage
+fi
+
+# Run bootstrap steps
+
+run collect_project_info
+run setup_wordpress
+if [ $INSTALL_CUSTOM_THEME ] ; then
+    run setup_wordpress_theme
+fi
+run create_readme
+run create_changelog

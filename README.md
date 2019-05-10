@@ -1,2 +1,2 @@
-# scaffold
-Bash script for scaffolding (wordpress) projects
+# Scaffold
+Experimental bash script for scaffolding (wordpress) projects
